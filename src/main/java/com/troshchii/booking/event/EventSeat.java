@@ -37,7 +37,7 @@ public class EventSeat {
     @JoinColumn(name = "booking_id")
     private Booking booking;
 
-    @Enumerated(EnumType.STRING)
+    @Convert(converter = EventSeatStatusConverter.class)
     @Column(nullable = false)
     private EventSeatStatus status = EventSeatStatus.AVAILABLE;
 

@@ -24,7 +24,7 @@ public class Booking {
     @Column(name = "idempotency_key", nullable = false, unique = true)
     private String idempotencyKey;
 
-    @Enumerated(EnumType.STRING)
+    @Convert(converter = BookingStatusConverter.class)
     @Column(nullable = false)
     private BookingStatus status = BookingStatus.CONFIRMED;
 }

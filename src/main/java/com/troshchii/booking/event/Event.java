@@ -25,7 +25,7 @@ public class Event {
     @Column(nullable = false)
     private String title;
 
-    @Enumerated(EnumType.STRING)
+    @Convert(converter = EventTypeConverter.class)
     @Column(nullable = false)
     private EventType type;
 
