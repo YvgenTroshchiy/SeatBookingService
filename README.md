@@ -6,28 +6,101 @@ under contention, versioned migrations, security, tests, and a containerized del
 
 ## Stack
 
-Java 21 · Spring Boot 4 · PostgreSQL · Flyway · Spring Security (JWT) · Testcontainers · Docker · GitHub Actions
+Java 21 · Spring Boot 4 · PostgreSQL · Redis · Flyway · Spring Security (JWT) · Testcontainers · Docker · GitHub Actions
 
 ## Domain model
 
-One generalized model covers all three use cases:
+One generalized model covers all three use cases — concert, cinema, flight are just an `Event` type.
 
-- `Venue` — physical place with a seating layout
-- `Seat` — a seat in a venue (section, row, number)
-- `Event` — a scheduled happening at a venue (the concert / screening / flight)
-- `EventSeat` — state of a seat *for a specific event*; availability lives here, not on `Seat`
-- `Booking` — a user's reservation of one or more `EventSeat`s
-- `User` — account + roles
+```mermaid
+erDiagram
+    VENUE {
+        uuid id
+        string name
+        string address
+    }
+    SEAT {
+        uuid id
+        uuid venue_id
+        string section
+        string row
+        string number
+    }
+    EVENT {
+        uuid id
+        uuid venue_id
+        string title
+        string type
+        timestamp starts_at
+    }
+    EVENT_SEAT {
+        uuid id
+        uuid event_id
+        uuid seat_id
+        uuid booking_id
+        enum status
+        timestamp held_until
+    }
+    BOOKING {
+        uuid id
+        uuid user_id
+        string idempotency_key
+        enum status
+    }
+    USER {
+        uuid id
+        string email
+        string password_hash
+        enum role
+    }
+
+    VENUE ||--o{ SEAT : "has"
+    VENUE ||--o{ EVENT : "hosts"
+    EVENT ||--o{ EVENT_SEAT : "generates"
+    SEAT ||--o{ EVENT_SEAT : "assigned to"
+    BOOKING ||--o{ EVENT_SEAT : "reserves"
+    USER ||--o{ BOOKING : "makes"
+```
+
+`EventSeat.status`: `AVAILABLE → HELD → BOOKED` (and back to `AVAILABLE` on expiry or cancel).
 
 ## Booking flow
 
-Hold → Confirm, Ticketmaster-style:
+Hold → Confirm, Ticketmaster-style. Two users racing for the same seat — exactly one wins.
 
-1. Client holds seats → status `HELD` with a 5-minute TTL
-2. Client confirms within the window → `BOOKED`; hold expires → seats free up automatically
+```mermaid
+sequenceDiagram
+    actor User
+    participant API
+    participant Redis
+    participant DB
 
-Concurrency is handled with optimistic locking (`@Version` on `EventSeat`) and a DB-level
-`UNIQUE(event_id, seat_id)` constraint as a backstop.
+    User->>API: GET /events/{id}/seats
+    API->>DB: query available EventSeats
+    DB-->>API: seat list
+    API-->>User: available seats
+
+    User->>API: POST /events/{id}/holds
+    API->>Redis: SET seat:{eventId}:{seatId} {userId} NX EX 300
+    alt seat is free
+        Redis-->>API: OK — hold acquired · TTL 5 min
+        API->>DB: UPDATE EventSeat SET status=HELD, held_until=now+5min
+        API-->>User: 200 holdId + expiresAt
+    else seat already held
+        Redis-->>API: nil
+        API-->>User: 409 seat no longer available
+    end
+
+    User->>API: POST /bookings (Idempotency-Key header)
+    API->>DB: verify hold still valid (status=HELD AND held_until > now)
+    alt hold valid
+        DB->>DB: INSERT booking · UPDATE status=BOOKED · COMMIT
+        API->>Redis: DEL seat:{eventId}:{seatId}
+        API-->>User: 201 Booking created
+    else hold expired
+        API-->>User: 409 hold expired
+    end
+```
 
 ## Running locally
 

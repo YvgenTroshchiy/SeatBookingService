@@ -55,42 +55,56 @@ User 1───* Booking
 ## 3. The hard part: no double-booking under contention
 
 This is the section that makes or breaks the project. Two users selecting the same seat for the
-same event at the same instant must result in **exactly one winner**. Implement and be able to
-explain several layers:
+same event at the same instant must result in **exactly one winner**.
 
-1. **Hold-then-confirm flow** (Ticketmaster-style)
-    - User *holds* seats → status `HELD` with a short TTL (e.g. 5 min).
-    - User *confirms* within the window → `BOOKED`. Otherwise the hold expires and seats free up.
-    - Realistic, and it forces you to think about expiry.
+### Concurrency strategy
 
-2. **Optimistic locking** — `@Version` on `EventSeat`
-    - No DB lock held; on a version conflict the loser gets an exception and retries/fails.
-    - Good default for low-to-moderate contention.
+**Redis as the gatekeeper (primary mechanism)**
 
-3. **Pessimistic locking** — `SELECT ... FOR UPDATE`
-    - Spring Data `@Lock(LockModeType.PESSIMISTIC_WRITE)` on the availability query.
-    - Simpler correctness, locks rows for the transaction's duration. Discuss the trade-off vs (2).
+```
+SET seat:{eventId}:{seatId} {userId} NX EX 300
+```
 
-4. **Unique constraint as a backstop**
-    - DB-level unique constraint on `(event_id, seat_id)` in the active-booking/hold table.
-    - Even if app logic has a race, the database refuses the second insert. Belt-and-suspenders.
+- `NX` — set only if key does not exist: atomic, no race window.
+- `EX 300` — TTL of 5 minutes; hold expires automatically, no sweep job needed.
+- Only one thread wins; everyone else gets 409 immediately, before touching Postgres.
 
-5. **Idempotency keys** on the booking endpoint
-    - Handles double-clicks and client retries without creating duplicate bookings.
+**DB unique constraint as the backstop**
 
-**Recommended implementation:** hold/confirm flow + optimistic locking + unique constraint as
-the safety net. Mention pessimistic locking and idempotency as understood alternatives.
+- `UNIQUE(event_id, seat_id)` on the bookings table.
+- Even if Redis state is somehow inconsistent, the database refuses a duplicate insert.
+- Belt-and-suspenders: two independent layers, neither trusts the other.
+
+**Idempotency key on confirm**
+
+- Client sends an `Idempotency-Key` header on `POST /bookings`.
+- Double-click or network retry returns the same booking instead of creating a duplicate charge.
+
+### The interesting edge case
+
+What if the Redis TTL expires at the exact moment the user sends confirm?
+
+The confirm handler must re-verify the hold inside the DB transaction:
+1. Check `EventSeat.status = HELD` and `held_until > now()`.
+2. If expired → 409, do not insert booking.
+3. If valid → insert booking, flip `EventSeat.status = BOOKED`, commit.
+
+Redis says "who got the hold"; Postgres is the source of truth for durable state.
+If they disagree, Postgres wins.
 
 ---
 
 ## 4. Hold expiry
 
-Holds must free themselves up. Two options, pick one (or both):
-- **Lazy expiry** — on every availability read, treat `HELD` rows past their TTL as `AVAILABLE`.
-- **Scheduled sweep** — a `@Scheduled` job that flips expired holds back to `AVAILABLE`.
+Redis TTL handles expiry automatically — when the key disappears, the seat is free again for
+new hold attempts. No sweep job needed for the Redis side.
 
-Lazy is simplest and always-correct on read; the scheduled job keeps the table tidy. Doing both
-is a good talking point about eventual vs read-time consistency.
+Postgres still needs to know a hold expired (for the confirm-time check). Two options:
+- **Lazy expiry** — on confirm, check `held_until > now()`. If not, reject. Simple and correct.
+- **Scheduled sweep** — a `@Scheduled` job that flips stale `HELD` rows back to `AVAILABLE`.
+
+Lazy is enough for correctness; the sweep keeps the table tidy and is a good talking point
+about eventual vs read-time consistency.
 
 ---
 
@@ -101,6 +115,7 @@ is a good talking point about eventual vs read-time consistency.
 | Web / REST     | Spring Web (MVC) |
 | Persistence    | Spring Data JPA + Hibernate |
 | Database       | PostgreSQL |
+| Cache / holds  | Redis (`SET NX EX` for atomic hold, Spring Data Redis) |
 | Migrations     | Flyway (SQL-first, readable, versioned) |
 | Auth           | Spring Security + JWT (stateless) |
 | Validation     | Jakarta Bean Validation |
@@ -108,7 +123,7 @@ is a good talking point about eventual vs read-time consistency.
 | DTO mapping    | MapStruct (optional, keeps entities out of the API) |
 | Tests          | JUnit 5 + AssertJ + Testcontainers |
 | Health/metrics | Spring Boot Actuator |
-| Container      | Docker + docker-compose (app + Postgres) |
+| Container      | Docker + docker-compose (app + Postgres + Redis) |
 | CI             | GitHub Actions |
 
 ---
@@ -159,8 +174,7 @@ POST   /api/events                      -> creates Event + generates EventSeats 
 
 - Schema lives in **Flyway migrations** (`src/main/resources/db/migration`), never auto-DDL.
 - Set `spring.jpa.hibernate.ddl-auto=validate` so Hibernate checks the schema but never changes it.
-- Key constraints: FK integrity, `UNIQUE(event_id, seat_id)` on active holds/bookings,
-  `@Version` column on `EventSeat`.
+- Key constraints: FK integrity, `UNIQUE(event_id, seat_id)` on active holds/bookings.
 - Indexes on `(event_id, status)` for fast availability queries.
 
 ---
